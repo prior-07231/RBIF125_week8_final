@@ -282,7 +282,7 @@ ggsave("results/figures/library_sizes.png", library_size_plot, width = 10, heigh
 ## 3.2 Principal Component Analysis
 
 ```{r pca-analysis, fig.width=10, fig.height=7}
-# Filter genes with zero variance before PCA
+# filter genes with zero variance before PCA
 gene_vars <- apply(expr_matrix_counts, 1, var, na.rm = TRUE)
 genes_with_var <- gene_vars > 0 & !is.na(gene_vars)
 expr_matrix_filtered <- expr_matrix_counts[genes_with_var, ]
@@ -322,7 +322,7 @@ pca_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = severity, shape = s
 
 print(pca_plot)
 ggsave("results/figures/pca_plot.png", pca_plot, width = 10, height = 7)
-print("Saved: results/figures/pca_plot.png")
+
 ```
 
 ## 3.3 Gene Detection Rates
@@ -366,9 +366,8 @@ ggsave("results/figures/gene_detection.png", gene_detection_plot, width = 10, he
 ## 4.1 Run DESeq2
 
 ```{r run-deseq}
-print("Running DESeq2 pipeline (normalization, dispersion, testing)...")
+#run DESeq2
 dds <- DESeq(dds)
-print("DESeq2 analysis complete")
 ```
 
 ## 4.2 Extract Results
@@ -406,9 +405,8 @@ sig_genes_top10 <- res_df[res_df$significant == TRUE, c("gene_id", "log2FoldChan
 print(head(sig_genes_top10, 10))
 
 write.csv(res_df, "results/tables/de_results_longcovid_vs_convalescent.csv", row.names = FALSE)
-print("Saved: results/tables/de_results_longcovid_vs_convalescent.csv")
 
-#Annotate top DE genes for display (Ensembl ID -> Symbol + Name)
+#annotate top DE genes for display (Ensembl ID -> Symbol + Name)
 top_de_genes <- res_df[res_df$significant == TRUE, ]
 top_de_genes <- top_de_genes[order(top_de_genes$padj), ]
 
@@ -421,7 +419,7 @@ if (nrow(top_de_genes) > 0) {
     keytype = "ENSEMBL"
   )
 
-  # Merge annotations (keep all Ensembl IDs, allow duplicates if genes map to multiple symbols)
+  #merge annotations (keep all Ensembl IDs, allow duplicates if genes map to multiple symbols)
   top_de_annotated <- merge(
     top_de_genes,
     gene_annotation,
@@ -446,6 +444,7 @@ if (nrow(top_de_genes) > 0) {
 ## 5.1 Volcano Plot
 
 ```{r volcano-plot, fig.width=10, fig.height=8}
+#Generate volcano plot of DE genes
 volcano_data <- res_df[!is.na(res_df$padj), ]
 volcano_data$neg_log10_padj <- -log10(volcano_data$padj)
 volcano_data$color_group <- ifelse(volcano_data$direction == "Up", "Upregulated in Long COVID",
@@ -480,9 +479,9 @@ ggsave("results/figures/volcano_plot_longcovid.png", volcano_plot, width = 10, h
 # 6. Variance Stabilizing Transformation
 
 ```{r vst-transform}
-# VST stabilizes variance across the mean, making the data suitable for PCA and Random Forest
+# VST stabilizes variance across the mean; necessary preprocessing for both PCA and Random Forest
 
-vst_data <- vst(dds, blind = FALSE)
+vst_data <- vst(dds, blind = TRUE)
 vst_matrix <- assay(vst_data)
 print(paste("VST matrix dimensions:", nrow(vst_matrix), "x", ncol(vst_matrix)))
 print(paste("VST value range:", round(min(vst_matrix), 2), "to", round(max(vst_matrix), 2)))
@@ -495,119 +494,127 @@ print(vst_matrix[1:3, 1:3])
 # 7. Machine Learning: Feature Selection
 
 ```{r feature-selection}
-# Select top differentially expressed genes as features for Random Forest
-
-res_df_clean <- res_df[!is.na(res_df$padj), ]
-res_df_sorted <- res_df_clean[order(res_df_clean$padj), ]
-feature_genes <- head(res_df_sorted$gene_id, N_TOP_GENES)
-
-print("Top 10 feature genes:")
-print(head(feature_genes, 10))
-
-# Transpose to samples as rows, features as columns for input to Random Forest
-feature_matrix <- t(vst_matrix[feature_genes, ])
-ml_labels <- metadata$severity_clean
-
-ml_data <- as.data.frame(feature_matrix)
-ml_data$severity <- ml_labels
-
-print(paste("Random Forest dataset:", nrow(ml_data), "samples x", ncol(ml_data)-1, "features"))
-print("Class distribution in dataset:")
-print(table(ml_data$severity))
-print("ML data preview (first 3 samples, first 5 features + label):")
-print(ml_data[1:3, c(1:5, ncol(ml_data))])
-```
-
----
-
-# 8. Random Forest Classifier
-
-## 8.1 Setup Cross-Validation
-
-```{r rf-cv-setup}
-# K-fold CV: Data split into N_FOLDS folds, train on K-1, test on 1, repeat K times
-train_control <- trainControl(
-  method = "cv",
-  number = N_FOLDS,
-  savePredictions = "final",
-  classProbs = TRUE,
-  allowParallel = TRUE
-)
-
-# mtry = number of features randomly sampled at each split
-rf_grid <- expand.grid(
-  mtry = round(c(sqrt(N_TOP_GENES), N_TOP_GENES/3, N_TOP_GENES/2))
-)
-
-print(rf_grid)
-print(paste("Total models to train:", nrow(rf_grid), "x", N_FOLDS, "folds =", nrow(rf_grid) * N_FOLDS, "fits"))
-```
-
-## 8.2 Train Random Forest
-
-```{r rf-train}
-
-print(paste("Dataset:", nrow(ml_data), "samples x", ncol(ml_data)-1, "features"))
-print(paste("Classes:", paste(levels(ml_data$severity), collapse = ", ")))
-
-#set for reproducible results
 set.seed(3)
+#create folds based on class distribution
+folds <- createFolds(coldata$severity, k = N_FOLDS, returnTrain = TRUE)
 
-rf_model <- train(
-  severity ~ .,
-  data = ml_data,
-  method = "rf",
-  trControl = train_control,
-  tuneGrid = rf_grid,
-  ntree = 500,
-  importance = TRUE
-)
+cv_predictions <- list()
+feature_importance_list <- list()
 
-print(rf_model)
+#loop for nested cross-validation. DESeq2 will run inside each fold to identifty features
+for(i in seq_along(folds)) {
+  
+  train_indices <- folds[[i]]
+  test_indices <- setdiff(seq_len(ncol(expr_matrix_counts)), train_indices)
+  
+  # use training data
+  train_counts <- expr_matrix_counts[, train_indices]
+  train_coldata <- coldata[train_indices, , drop = FALSE]
+  
+  #DESeq2 on the training split to find DE genes
+  dds_train <- DESeqDataSetFromMatrix(
+    countData = train_counts,
+    colData = train_coldata,
+    design = ~ severity
+  )
+  
+  dds_train <- DESeq(dds_train, quiet = TRUE)
+  res_train <- results(dds_train, contrast = c("severity", "Long_COVID", "Convalescent"), alpha = 0.05)
+  
+  # identify top genes based on the training split only
+  res_train_df <- as.data.frame(res_train)
+  res_train_df <- res_train_df[!is.na(res_train_df$padj), ]
+  res_train_sorted <- res_train_df[order(res_train_df$padj), ]
+  top_genes_fold <- head(rownames(res_train_sorted), N_TOP_GENES)
+  
+  # subset to the top genes
+  train_vst <- t(vst_matrix[top_genes_fold, train_indices])
+  test_vst  <- t(vst_matrix[top_genes_fold, test_indices])
+  
+  train_data <- data.frame(train_vst, severity = train_coldata$severity)
+  test_data  <- data.frame(test_vst, severity = coldata$severity[test_indices])
+  
+  #train on the training split
+  rf_grid <- expand.grid(mtry = round(c(sqrt(N_TOP_GENES), N_TOP_GENES/3, N_TOP_GENES/2)))
+  
+  rf_model_fold <- train(
+    severity ~ .,
+    data = train_data,
+    method = "rf",
+    tuneGrid = rf_grid,
+    trControl = trainControl(method = "oob", allowParallel = TRUE),
+    ntree = 500,
+    importance = TRUE
+  )
+  
+  #predict on the held-out test split
+  fold_preds <- predict(rf_model_fold, newdata = test_data)
+  
+  cv_predictions[[i]] <- data.frame(
+    sample = rownames(test_data),
+    obs = test_data$severity,
+    pred = fold_preds,
+    fold = paste0("Fold", i)
+  )
+  
+  #store importance scores for the fold
+  fold_imp <- varImp(rf_model_fold)$importance
+  fold_imp$gene <- rownames(fold_imp)
+  feature_importance_list[[i]] <- fold_imp
+}
+
+# aggregate all test set predictions
+all_predictions <- do.call(rbind, cv_predictions)
 ```
 
 ---
 
-# 9. Model Evaluation
+# 8. Model Evaluation
 
-## 9.1 Confusion Matrix
+## 8.1 Confusion Matrix
 
 ```{r confusion-matrix, fig.width=8, fig.height=7}
-predictions <- rf_model$pred[rf_model$pred$mtry == rf_model$bestTune$mtry, ]
-
-cm <- confusionMatrix(predictions$pred, predictions$obs)
+cm <- confusionMatrix(all_predictions$pred, all_predictions$obs)
 print(cm)
 
 cm_table <- as.data.frame(cm$table)
-write.csv(cm_table, "results/tables/confusion_matrix.csv", row.names = FALSE)
+write.csv(cm_table, "results/tables/nested_confusion_matrix.csv", row.names = FALSE)
 
 cm_plot <- ggplot(cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
   geom_tile(color = "white") +
   geom_text(aes(label = Freq), size = 5, fontface = "bold") +
   scale_fill_gradient(low = "white", high = "red") +
-  labs(title = "Confusion Matrix", x = "Actual", y = "Predicted") 
+  labs(title = "Confusion Matrix (Nested CV)", x = "Actual", y = "Predicted") 
 
 print(cm_plot)
-ggsave("results/figures/confusion_matrix.png", cm_plot, width = 8, height = 7)
+ggsave("results/figures/nested_confusion_matrix.png", cm_plot, width = 8, height = 7)
 ```
 
-## 9.2 Feature Importance
+## 8.2 Feature Importance
 
 ```{r feature-importance, fig.width=10, fig.height=8}
-# varImp returns class-specific scores for binary classification, 
-# use first column
-importance_scores <- varImp(rf_model)$importance
-importance_df <- data.frame(
-  gene = rownames(importance_scores),
-  importance = importance_scores[, 1]  # Use first column for binary classification
-)
-importance_df <- importance_df[order(-importance_df$importance), ]
-importance_df <- head(importance_df, 20)
+# combine importance from all folds and calculate the average score for each gene
+all_importance <- bind_rows(feature_importance_list, .id = "fold")
 
-print("Top 20 most important features:")
+grouped_importance <- group_by(all_importance, gene)
+
+avg_importance <- summarize(
+  grouped_importance,
+  importance = mean(Convalescent, na.rm = TRUE)
+)
+
+#sort by ranking
+avg_importance <- arrange(
+  avg_importance,
+  desc(importance)
+)
+
+importance_df <- head(avg_importance, 20)
+
+print("Top 20 most important features (Averaged across folds):")
 print(importance_df)
 
-# For feature importance genes, add symbols and names
+# add annotations to features
 feature_annotation <- AnnotationDbi::select(
   org.Hs.eg.db,
   keys = importance_df$gene,
@@ -615,7 +622,7 @@ feature_annotation <- AnnotationDbi::select(
   keytype = "ENSEMBL"
 )
 
-# Merge annotations for combined result
+#merge feature info 
 importance_df_annotated <- merge(
   importance_df,
   feature_annotation,
@@ -625,33 +632,27 @@ importance_df_annotated <- merge(
 )
 importance_df_annotated <- importance_df_annotated[order(-importance_df_annotated$importance), ]
 
-# Save annotated feature importance csv file
-write.csv(importance_df_annotated, "results/tables/feature_importance_annotated.csv", row.names = FALSE)
-print("Saved: results/tables/feature_importance_annotated.csv")
-
-print("Top 20 most important features:")
-print(importance_df_annotated[, c("gene", "SYMBOL", "GENENAME", "importance")])
+write.csv(importance_df_annotated, "results/tables/nested_feature_importance.csv", row.names = FALSE)
 
 importance_plot <- ggplot(importance_df, aes(x = reorder(gene, importance), y = importance)) +
   geom_bar(stat = "identity", fill = "blue") +
   coord_flip() +
-  labs(title = "Top 20 Most Important Features", x = "Gene", y = "Importance Score") 
+  labs(title = "Top 20 Important Features (Nested CV Average)", x = "Gene", y = "Average Importance Score") 
 
 print(importance_plot)
-ggsave("results/figures/feature_importance.png", importance_plot, width = 10, height = 8)
+ggsave("results/figures/nested_feature_importance.png", importance_plot, width = 10, height = 8)
 ```
 
-## 9.3 Summary
+## 8.3 Summary
 
 ```{r summary}
-cat("Overall Accuracy:", round(cm$overall["Accuracy"], 3), "\n")
-cat("Kappa:", round(cm$overall["Kappa"], 3), "\n")
-cat("Best mtry:", rf_model$bestTune$mtry, "\n")
+cat("Overall Accuracy (Nested CV):", round(cm$overall["Accuracy"], 3), "\n")
+cat("Kappa (Nested CV):", round(cm$overall["Kappa"], 3), "\n")
 ```
 
 ---
 
-# 10. Session Info
+# 9. Session Info
 
 ```{r session-info}
 sessionInfo()
