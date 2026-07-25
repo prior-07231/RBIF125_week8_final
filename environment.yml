@@ -1,0 +1,32 @@
+name: RIBF125-final
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  # Bioconductor packages
+  - bioconductor-deseq2
+  - bioconductor-geoquery
+  - bioconductor-clusterprofiler
+  - bioconductor-org.hs.eg.db
+
+  - r-base=4.3
+  - r-tidyverse
+  - r-tidyr
+  - r-tibble
+  - r-ggplot2
+  - r-pheatmap
+  - r-cowplot
+  - r-rcolorbrewer
+  - r-scales
+  - r-randomforest
+  - r-caret
+  - r-proc
+  - r-e1071
+  - r-doparallel
+  - r-foreach
+  - r-rmarkdown
+  - r-knitr
+  - pandoc
+  - r-devtools
+

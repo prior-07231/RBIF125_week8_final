@@ -1,0 +1,648 @@
+---
+title: "RBIF125_Final_Prior"
+author: "Andrew Prior"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: cosmo
+    highlight: tango
+    fig_width: 10
+    fig_height: 7
+---
+
+```{r setup, include=FALSE}
+# Use current directory (where this Rmd file is located)
+# Works on both Windows and Linux
+PROJECT_DIR <- getwd()
+knitr::opts_knit$set(root.dir = PROJECT_DIR)
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.path = "results/figures/",
+  cache = FALSE
+)
+```
+# Long COVID Prediction from PBMC Transcriptomics
+
+# 1. Setup & Configuration
+
+## 1.1 Load Libraries
+
+```{r load-libraries, message=FALSE}
+library(DESeq2)
+library(GEOquery)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(dplyr)
+library(tidyr)
+library(tibble)
+library(ggplot2)
+library(pheatmap)
+library(RColorBrewer)
+library(scales)
+library(randomForest)
+library(caret)
+library(pROC)
+library(e1071)
+library(doParallel)
+library(foreach)
+```
+
+## 1.2 Configuration
+
+```{r config-params}
+
+#set parameters for script
+n_cores <- parallel::detectCores() - 1
+n_cores <- max(1, n_cores)
+registerDoParallel(cores = n_cores)
+set.seed(42)
+
+PADJ_THRESHOLD <- 0.05
+LOG2FC_THRESHOLD <- 1.5
+N_TOP_GENES <- 100
+N_FOLDS <- 10
+
+#create output folders
+dir.create("results", showWarnings = FALSE)
+dir.create("results/figures", showWarnings = FALSE, recursive = TRUE)
+dir.create("results/tables", showWarnings = FALSE, recursive = TRUE)
+dir.create("data/raw", showWarnings = FALSE, recursive = TRUE)
+dir.create("data/processed", showWarnings = FALSE, recursive = TRUE)
+```
+
+## 1.3 Custom Functions
+
+```{r custom-functions}
+# save plots to file
+save_plot <- function(plot_obj, filename, width = 10, height = 7) {
+  filepath <- file.path("results/figures", filename)
+  ggsave(filepath, plot_obj, width = width, height = height, dpi = 300)
+}
+# save tables to file
+save_table <- function(data_frame, filename) {
+  filepath <- file.path("results/tables", filename)
+  write.csv(data_frame, filepath, row.names = FALSE)
+}
+```
+
+---
+
+# 2. Data Loading
+
+## 2.1 Load Metadata
+
+```{r download-metadata}
+
+#Retrieve GEO metadata
+GEO_ACCESSION <- "GSE226260"
+series_file <- "data/raw/GSE226260-GPL24676_series_matrix.txt.gz"
+
+if (file.exists(series_file)) {
+  gse <- getGEO(filename = series_file, getGPL = FALSE)
+} else {
+  gse_list <- getGEO(GEO_ACCESSION, GSEMatrix = TRUE, destdir = "data/raw", getGPL = FALSE)
+  gse <- gse_list[[1]]
+}
+
+metadata <- pData(gse)
+print(paste("Metadata dimensions:", nrow(metadata), "x", ncol(metadata)))
+print("Metadata column names (first 10):")
+print(head(colnames(metadata), 10))
+print("Sample IDs (first 3):")
+print(head(rownames(metadata), 3))
+```
+
+## 2.2 Download Expression Data
+
+```{r download-expression}
+
+#Retrieve GEO count data
+combined_file <- "data/raw/GSE226260/GSE226260_combined.ExprData.updated.csv.gz"
+
+if (!file.exists(combined_file)) {
+  dir.create("data/raw/GSE226260", showWarnings = FALSE, recursive = TRUE)
+  download.file(
+    "https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE226260&format=file&file=GSE226260%5Fcombined%2EExprData%2Eupdated%2Ecsv%2Egz",
+    combined_file,
+    mode = "wb"
+  )
+}
+
+expr_data <- read.csv(gzfile(combined_file), check.names = FALSE)
+gene_names <- make.unique(as.character(expr_data[[1]]), sep = "_")
+rownames(expr_data) <- gene_names
+expr_matrix <- as.matrix(expr_data[, -1])
+
+print(paste("Expression dimensions:", nrow(expr_matrix), "genes x", ncol(expr_matrix), "samples"))
+print(paste("Value range:", round(min(expr_matrix, na.rm = TRUE), 2), "to", round(max(expr_matrix, na.rm = TRUE), 2)))
+print(expr_matrix[1:3, 1:3])
+```
+
+## 2.3 Align Samples
+
+```{r align-samples}
+#match metadata to counts data rows/columns
+expr_gcids <- sub("_.*$", "", colnames(expr_matrix))
+metadata_gcids <- metadata$`gcid:ch1`
+common_gcids <- intersect(expr_gcids, metadata_gcids)
+
+gcid_to_expr_col <- setNames(colnames(expr_matrix), expr_gcids)
+expr_matrix <- expr_matrix[, gcid_to_expr_col[common_gcids]]
+metadata <- metadata[match(common_gcids, metadata_gcids), ]
+
+colnames(expr_matrix) <- common_gcids
+rownames(metadata) <- common_gcids
+
+print(paste("Aligned samples:", length(common_gcids)))
+print(paste("Sample IDs match:", all(colnames(expr_matrix) == rownames(metadata))))
+print("Aligned sample IDs (first 3):")
+print(head(colnames(expr_matrix), 3))
+```
+
+## 2.4 Extract PASC Labels
+
+```{r extract-pasc}
+pasc_status <- metadata$`pasc status:ch1`
+print("PASC status distribution:")
+print(table(pasc_status, useNA = "ifany"))
+
+metadata$severity_clean <- ifelse(pasc_status == "NOPASC", "Convalescent",
+                                  ifelse(
+                                    pasc_status == "PASC",
+                                    "Long_COVID",
+                                    NA)
+                                  )
+metadata$severity_clean <- factor(metadata$severity_clean, levels = c("Convalescent", "Long_COVID"))
+
+has_label <- !is.na(metadata$severity_clean)
+metadata <- metadata[has_label, ]
+expr_matrix <- expr_matrix[, has_label]
+
+print("Final dataset after filtering:")
+print(table(metadata$severity_clean))
+print(paste("Final dimensions:", nrow(expr_matrix), "genes x", ncol(expr_matrix), "samples"))
+```
+
+## 2.5 Prepare for DESeq2
+
+```{r prepare-deseq}
+
+expr_matrix_counts <- round(expr_matrix)
+
+# remove genes with NA values
+has_na <- rowSums(is.na(expr_matrix_counts)) > 0
+print(paste("Genes with NA values:", sum(has_na)))
+expr_matrix_counts <- expr_matrix_counts[!has_na, ]
+print(paste("After removing NA genes:", nrow(expr_matrix_counts), "genes x", ncol(expr_matrix_counts), "samples"))
+
+# filter out low-count genes
+keep_genes <- rowSums(expr_matrix_counts) >= 10
+print(paste("Genes passing filter (>= 10 total counts):", sum(keep_genes)))
+expr_matrix_counts <- expr_matrix_counts[keep_genes, ]
+print(paste("Final count matrix:", nrow(expr_matrix_counts), "genes x", ncol(expr_matrix_counts), "samples"))
+
+coldata <- data.frame(
+  sample_id = rownames(metadata),
+  severity = metadata$severity_clean,
+  row.names = rownames(metadata)
+)
+print("Sample metadata for DESeq2 (first 3):")
+print(head(coldata, 3))
+
+#Create DEseq2 object
+library(DESeq2)
+dds <- DESeqDataSetFromMatrix(
+  countData = expr_matrix_counts,
+  colData = coldata,
+  design = ~ severity
+)
+
+print(paste("DESeq2 object:", nrow(dds), "genes x", ncol(dds), "samples"))
+print("Sample group distribution:")
+print(table(colData(dds)$severity))
+```
+
+---
+
+# 3. Quality Control
+
+## 3.1 Library Size Distribution
+
+```{r library-sizes, fig.width=10, fig.height=6}
+# Calculate total counts per sample
+library_sizes <- colSums(expr_matrix_counts)
+
+lib_size_df <- data.frame(
+  sample = colnames(expr_matrix_counts),
+  library_size = library_sizes,
+  severity = metadata$severity_clean,
+  row.names = NULL
+)
+
+print("Library size summary:")
+print(summary(library_sizes))
+print("Library sizes by group:")
+print(tapply(lib_size_df$library_size, lib_size_df$severity, summary))
+
+# Plot library size distribution
+library_size_plot <- ggplot(lib_size_df, aes(x = severity, y = library_size, fill = severity)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 16) +
+  geom_jitter(width = 0.2, alpha = 0.3, size = 1.5) +
+  scale_fill_manual(values = c("Convalescent" = "blue", "Long_COVID" = "red")) +
+  scale_y_log10(labels = scales::comma) +
+  labs(
+    title = "Library Size Distribution by Group",
+    subtitle = "Log10 scale",
+    x = "Group",
+    y = "Library Size (Total Counts)"
+  ) 
+
+print(library_size_plot)
+ggsave("results/figures/library_sizes.png", library_size_plot, width = 10, height = 6)
+```
+
+## 3.2 Principal Component Analysis
+
+```{r pca-analysis, fig.width=10, fig.height=7}
+# Filter genes with zero variance before PCA
+gene_vars <- apply(expr_matrix_counts, 1, var, na.rm = TRUE)
+genes_with_var <- gene_vars > 0 & !is.na(gene_vars)
+expr_matrix_filtered <- expr_matrix_counts[genes_with_var, ]
+
+print(paste("Genes before variance filtering:", nrow(expr_matrix_counts)))
+print(paste("Genes with variance > 0:", nrow(expr_matrix_filtered)))
+print(paste("Removed constant genes:", sum(!genes_with_var)))
+
+# Perform PCA 
+pca_result <- prcomp(t(expr_matrix_filtered), scale. = TRUE, center = TRUE)
+
+# Extract PC values
+pca_scores <- as.data.frame(pca_result$x[, 1:10])
+pca_scores$sample <- rownames(pca_scores)
+pca_scores$severity <- metadata$severity_clean
+
+# Calculate variance explained
+var_explained <- round(100 * pca_result$sdev^2 / sum(pca_result$sdev^2), 1)
+
+print("Variance explained by first 5 PCs:")
+print(var_explained[1:5])
+
+# Plot PC1 vs PC2
+pca_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = severity, shape = severity)) +
+  geom_point(size = 3, alpha = 0.7) +
+  scale_color_manual(values = c("Convalescent" = "blue", "Long_COVID" = "red")) +
+  scale_shape_manual(values = c(16, 17)) +
+  labs(
+    title = "Principal Component Analysis",
+    subtitle = "Sample clustering by group",
+    x = paste0("PC1 (", var_explained[1], "% variance)"),
+    y = paste0("PC2 (", var_explained[2], "% variance)"),
+    color = "Group",
+    shape = "Group"
+  ) +
+  theme(legend.position = "right")
+
+print(pca_plot)
+ggsave("results/figures/pca_plot.png", pca_plot, width = 10, height = 7)
+print("Saved: results/figures/pca_plot.png")
+```
+
+## 3.3 Gene Detection Rates
+
+```{r gene-detection, fig.width=10, fig.height=6}
+# Calculate genes detected per sample (count > 0)
+genes_detected <- colSums(expr_matrix_counts > 0)
+
+detection_df <- data.frame(
+  sample = names(genes_detected),
+  genes_detected = genes_detected,
+  severity = metadata$severity_clean,
+  row.names = NULL
+)
+
+print("Gene detection summary:")
+print(summary(genes_detected))
+print("Gene detection by group:")
+print(tapply(detection_df$genes_detected, detection_df$severity, summary))
+
+# plot gene detection rates for each group
+gene_detection_plot <- ggplot(detection_df, aes(x = severity, y = genes_detected, fill = severity)) +
+  geom_boxplot(alpha = 0.7, outlier.shape = 16) +
+  geom_jitter(width = 0.2, size = 1.5) +
+  scale_fill_manual(values = c("Convalescent" = "blue", "Long_COVID" = "red")) +
+  labs(
+    title = "Gene Detection Rate by Group",
+    x = "Group",
+    y = "Number of Genes Detected"
+  ) +
+  theme(legend.position = "none")
+
+print(gene_detection_plot)
+ggsave("results/figures/gene_detection.png", gene_detection_plot, width = 10, height = 6)
+```
+
+---
+
+# 4. Differential Expression Analysis
+
+## 4.1 Run DESeq2
+
+```{r run-deseq}
+print("Running DESeq2 pipeline (normalization, dispersion, testing)...")
+dds <- DESeq(dds)
+print("DESeq2 analysis complete")
+```
+
+## 4.2 Extract Results
+
+```{r extract-de-results}
+res_longcovid_vs_conv <- results(
+  dds,
+  contrast = c("severity", "Long_COVID", "Convalescent"),
+  alpha = 0.05
+)
+
+res_df <- as.data.frame(res_longcovid_vs_conv)
+res_df$gene_id <- rownames(res_df)
+res_df <- res_df[order(res_df$padj), ]
+
+res_df$significant <- res_df$padj < 0.05 & abs(res_df$log2FoldChange) > 1.5
+res_df$direction <- ifelse(
+  res_df$log2FoldChange > 1.5 & res_df$padj < 0.05,
+  "Up",
+  ifelse(
+    res_df$log2FoldChange < -1.5 & res_df$padj < 0.05,
+    "Down",
+    "NS"
+  )
+)
+
+print("Differential Expression Summary:")
+print(paste("Total genes tested:", nrow(res_df)))
+print(paste("Significant genes (padj < 0.05):", sum(res_df$padj < 0.05, na.rm = TRUE)))
+print(paste("Upregulated in Long COVID (log2FC > 1.5, padj < 0.05):", sum(res_df$direction == "Up", na.rm = TRUE)))
+print(paste("Downregulated in Long COVID (log2FC < -1.5, padj < 0.05):", sum(res_df$direction == "Down", na.rm = TRUE)))
+
+print("Top 10 significant genes:")
+sig_genes_top10 <- res_df[res_df$significant == TRUE, c("gene_id", "log2FoldChange", "padj")]
+print(head(sig_genes_top10, 10))
+
+write.csv(res_df, "results/tables/de_results_longcovid_vs_convalescent.csv", row.names = FALSE)
+print("Saved: results/tables/de_results_longcovid_vs_convalescent.csv")
+
+#Annotate top DE genes for display (Ensembl ID -> Symbol + Name)
+top_de_genes <- res_df[res_df$significant == TRUE, ]
+top_de_genes <- top_de_genes[order(top_de_genes$padj), ]
+
+if (nrow(top_de_genes) > 0) {
+  # add Ensembl IDs to gene symbols and names
+  gene_annotation <- AnnotationDbi::select(
+    org.Hs.eg.db,
+    keys = top_de_genes$gene_id,
+    columns = c("SYMBOL", "GENENAME"),
+    keytype = "ENSEMBL"
+  )
+
+  # Merge annotations (keep all Ensembl IDs, allow duplicates if genes map to multiple symbols)
+  top_de_annotated <- merge(
+    top_de_genes,
+    gene_annotation,
+    by.x = "gene_id",
+    by.y = "ENSEMBL",
+    all.x = TRUE
+  )
+  top_de_annotated <- top_de_annotated[order(top_de_annotated$padj), ]
+
+  # save annotated top DE genes for human review
+  write.csv(top_de_annotated, "results/tables/top_de_genes_annotated.csv", row.names = FALSE)
+
+  print("Top 20 DE genes with gene symbols:")
+  print(top_de_annotated[1:min(20, nrow(top_de_annotated)), c("gene_id", "SYMBOL", "GENENAME", "log2FoldChange", "padj")])
+}
+```
+
+---
+
+# 5. Visualization
+
+## 5.1 Volcano Plot
+
+```{r volcano-plot, fig.width=10, fig.height=8}
+volcano_data <- res_df[!is.na(res_df$padj), ]
+volcano_data$neg_log10_padj <- -log10(volcano_data$padj)
+volcano_data$color_group <- ifelse(volcano_data$direction == "Up", "Upregulated in Long COVID",
+                                   ifelse(
+                                     volcano_data$direction == "Down",
+                                     "Downregulated in Long COVID",
+                                     "Not Significant")
+                                   )
+
+volcano_plot <- ggplot(volcano_data, aes(x = log2FoldChange, y = neg_log10_padj, color = color_group)) +
+  geom_point(alpha = 0.6, size = 1.5) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  geom_vline(xintercept = c(-1.5, 1.5), linetype = "dashed", color = "black") +
+  scale_color_manual(
+    values = c("Upregulated in Long COVID" = "red",
+               "Downregulated in Long COVID" = "blue",
+               "Not Significant" = "black"),
+    name = "Gene Status"
+  ) +
+  labs(
+    title = "Volcano Plot: Long COVID vs Convalescent",
+    x = "Log2 Fold Change",
+    y = "-Log10(Adjusted P-value)"
+  ) 
+
+print(volcano_plot)
+ggsave("results/figures/volcano_plot_longcovid.png", volcano_plot, width = 10, height = 8)
+```
+
+---
+
+# 6. Variance Stabilizing Transformation
+
+```{r vst-transform}
+# VST stabilizes variance across the mean, making the data suitable for PCA and Random Forest
+
+vst_data <- vst(dds, blind = FALSE)
+vst_matrix <- assay(vst_data)
+print(paste("VST matrix dimensions:", nrow(vst_matrix), "x", ncol(vst_matrix)))
+print(paste("VST value range:", round(min(vst_matrix), 2), "to", round(max(vst_matrix), 2)))
+print("VST data preview (first 3 genes, first 3 samples):")
+print(vst_matrix[1:3, 1:3])
+```
+
+---
+
+# 7. Machine Learning: Feature Selection
+
+```{r feature-selection}
+# Select top differentially expressed genes as features for Random Forest
+
+res_df_clean <- res_df[!is.na(res_df$padj), ]
+res_df_sorted <- res_df_clean[order(res_df_clean$padj), ]
+feature_genes <- head(res_df_sorted$gene_id, N_TOP_GENES)
+
+print("Top 10 feature genes:")
+print(head(feature_genes, 10))
+
+# Transpose to samples as rows, features as columns for input to Random Forest
+feature_matrix <- t(vst_matrix[feature_genes, ])
+ml_labels <- metadata$severity_clean
+
+ml_data <- as.data.frame(feature_matrix)
+ml_data$severity <- ml_labels
+
+print(paste("Random Forest dataset:", nrow(ml_data), "samples x", ncol(ml_data)-1, "features"))
+print("Class distribution in dataset:")
+print(table(ml_data$severity))
+print("ML data preview (first 3 samples, first 5 features + label):")
+print(ml_data[1:3, c(1:5, ncol(ml_data))])
+```
+
+---
+
+# 8. Random Forest Classifier
+
+## 8.1 Setup Cross-Validation
+
+```{r rf-cv-setup}
+# K-fold CV: Data split into N_FOLDS folds, train on K-1, test on 1, repeat K times
+train_control <- trainControl(
+  method = "cv",
+  number = N_FOLDS,
+  savePredictions = "final",
+  classProbs = TRUE,
+  allowParallel = TRUE
+)
+
+# mtry = number of features randomly sampled at each split
+rf_grid <- expand.grid(
+  mtry = round(c(sqrt(N_TOP_GENES), N_TOP_GENES/3, N_TOP_GENES/2))
+)
+
+print(rf_grid)
+print(paste("Total models to train:", nrow(rf_grid), "x", N_FOLDS, "folds =", nrow(rf_grid) * N_FOLDS, "fits"))
+```
+
+## 8.2 Train Random Forest
+
+```{r rf-train}
+
+print(paste("Dataset:", nrow(ml_data), "samples x", ncol(ml_data)-1, "features"))
+print(paste("Classes:", paste(levels(ml_data$severity), collapse = ", ")))
+
+#set for reproducible results
+set.seed(3)
+
+rf_model <- train(
+  severity ~ .,
+  data = ml_data,
+  method = "rf",
+  trControl = train_control,
+  tuneGrid = rf_grid,
+  ntree = 500,
+  importance = TRUE
+)
+
+print(rf_model)
+```
+
+---
+
+# 9. Model Evaluation
+
+## 9.1 Confusion Matrix
+
+```{r confusion-matrix, fig.width=8, fig.height=7}
+predictions <- rf_model$pred[rf_model$pred$mtry == rf_model$bestTune$mtry, ]
+
+cm <- confusionMatrix(predictions$pred, predictions$obs)
+print(cm)
+
+cm_table <- as.data.frame(cm$table)
+write.csv(cm_table, "results/tables/confusion_matrix.csv", row.names = FALSE)
+
+cm_plot <- ggplot(cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Freq), size = 5, fontface = "bold") +
+  scale_fill_gradient(low = "white", high = "red") +
+  labs(title = "Confusion Matrix", x = "Actual", y = "Predicted") 
+
+print(cm_plot)
+ggsave("results/figures/confusion_matrix.png", cm_plot, width = 8, height = 7)
+```
+
+## 9.2 Feature Importance
+
+```{r feature-importance, fig.width=10, fig.height=8}
+# varImp returns class-specific scores for binary classification, 
+# use first column
+importance_scores <- varImp(rf_model)$importance
+importance_df <- data.frame(
+  gene = rownames(importance_scores),
+  importance = importance_scores[, 1]  # Use first column for binary classification
+)
+importance_df <- importance_df[order(-importance_df$importance), ]
+importance_df <- head(importance_df, 20)
+
+print("Top 20 most important features:")
+print(importance_df)
+
+# For feature importance genes, add symbols and names
+feature_annotation <- AnnotationDbi::select(
+  org.Hs.eg.db,
+  keys = importance_df$gene,
+  columns = c("SYMBOL", "GENENAME"),
+  keytype = "ENSEMBL"
+)
+
+# Merge annotations for combined result
+importance_df_annotated <- merge(
+  importance_df,
+  feature_annotation,
+  by.x = "gene",
+  by.y = "ENSEMBL",
+  all.x = TRUE
+)
+importance_df_annotated <- importance_df_annotated[order(-importance_df_annotated$importance), ]
+
+# Save annotated feature importance csv file
+write.csv(importance_df_annotated, "results/tables/feature_importance_annotated.csv", row.names = FALSE)
+print("Saved: results/tables/feature_importance_annotated.csv")
+
+print("Top 20 most important features:")
+print(importance_df_annotated[, c("gene", "SYMBOL", "GENENAME", "importance")])
+
+importance_plot <- ggplot(importance_df, aes(x = reorder(gene, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "blue") +
+  coord_flip() +
+  labs(title = "Top 20 Most Important Features", x = "Gene", y = "Importance Score") 
+
+print(importance_plot)
+ggsave("results/figures/feature_importance.png", importance_plot, width = 10, height = 8)
+```
+
+## 9.3 Summary
+
+```{r summary}
+cat("Overall Accuracy:", round(cm$overall["Accuracy"], 3), "\n")
+cat("Kappa:", round(cm$overall["Kappa"], 3), "\n")
+cat("Best mtry:", rf_model$bestTune$mtry, "\n")
+```
+
+---
+
+# 10. Session Info
+
+```{r session-info}
+sessionInfo()
+```
+
+
