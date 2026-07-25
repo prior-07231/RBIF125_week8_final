@@ -95,18 +95,30 @@ save_table <- function(data_frame, filename) {
 
 # 2. Data Loading
 
-## 2.1 Load Metadata
+## 2.1 Retrieve/Load Metadata
 
 ```{r download-metadata}
-
 #Retrieve GEO metadata
-GEO_ACCESSION <- "GSE226260"
-series_file <- "data/raw/GSE226260-GPL24676_series_matrix.txt.gz"
 
+# set global download settings to prevent network timeouts
+options(timeout = 600)
+options(download.file.method = "libcurl")
+options('download.file.method.GEOquery' = 'libcurl')
+
+GEO_ACCESSION <- "GSE226260"
+series_file <- file.path("data/raw", "GSE226260-GPL24676_series_matrix.txt.gz")
+
+# load locally if file exists, otherwise download safely
 if (file.exists(series_file)) {
-  gse <- getGEO(filename = series_file, getGPL = FALSE)
+  # skip passing getGPL when reading local files
+  gse <- getGEO(filename = series_file)
 } else {
-  gse_list <- getGEO(GEO_ACCESSION, GSEMatrix = TRUE, destdir = "data/raw", getGPL = FALSE)
+  gse_list <- getGEO(
+    GEO = GEO_ACCESSION, 
+    GSEMatrix = TRUE, 
+    destdir = "data/raw", 
+    getGPL = FALSE
+  )
   gse <- gse_list[[1]]
 }
 
