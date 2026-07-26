@@ -483,13 +483,14 @@ for(i in seq_along(folds)) {
   train_counts <- expr_matrix_counts[, train_indices]
   train_coldata <- coldata[train_indices, , drop = FALSE]
   
-  #DESeq2 on the training split to find DE genes
+  #create DESeq2 on the training split to find DE genes
   dds_train <- DESeqDataSetFromMatrix(
     countData = train_counts,
     colData = train_coldata,
     design = ~ severity
   )
   
+  #run DESeq for training data
   dds_train <- DESeq(dds_train, quiet = TRUE)
   res_train <- results(dds_train, contrast = c("severity", "Long_COVID", "Convalescent"), alpha = 0.05)
   
@@ -506,14 +507,14 @@ for(i in seq_along(folds)) {
     colData = coldata[c(train_indices, test_indices), ],
     design = ~ severity
   )
-
+  
   vst_all <- varianceStabilizingTransformation(dds_all, blind = TRUE)
   vst_mat_all <- assay(vst_all)
 
-  # ensure genes exist
+  # ensure genes exist for top genes in the fold
   top_genes_fold <- intersect(top_genes_fold, rownames(vst_mat_all))
 
-  # build train/test datasets
+  # build train/test vst datasets
   train_vst <- t(vst_mat_all[top_genes_fold, train_indices])
   test_vst  <- t(vst_mat_all[top_genes_fold, test_indices])
 
@@ -537,6 +538,7 @@ for(i in seq_along(folds)) {
   fold_preds <- predict(rf_model_fold, newdata = test_data)
   fold_probs <- predict(rf_model_fold, newdata = test_data, type = "prob")
   
+  #store model results for this fold
   cv_predictions[[i]] <- data.frame(
     sample = rownames(test_data),
     obs = test_data$severity,
@@ -552,7 +554,7 @@ for(i in seq_along(folds)) {
   feature_importance_list[[i]] <- fold_imp
 }
 
-# aggregate all test set predictions
+# aggregate all results/predictions from folds
 all_predictions <- do.call(rbind, cv_predictions)
 ```
 
