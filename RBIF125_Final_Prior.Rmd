@@ -65,6 +65,7 @@ n_cores <- max(1, n_cores)
 registerDoParallel(cores = n_cores)
 set.seed(3)
 
+#custom parameters for thresholds and RF training.
 PADJ_THRESHOLD <- 0.05
 LOG2FC_THRESHOLD <- 1
 N_TOP_GENES <- 100
@@ -93,7 +94,7 @@ options('download.file.method.GEOquery' = 'libcurl')
 GEO_ACCESSION <- "GSE226260"
 series_file <- file.path("data/raw", "GSE226260-GPL24676_series_matrix.txt.gz")
 
-# load locally if file exists, otherwise download from GEO
+# check if exists locally, otherwise download from GEO
 if (file.exists(series_file)) {
   # skip passing getGPL when reading local files
   gse <- getGEO(filename = series_file)
@@ -119,9 +120,10 @@ print(head(rownames(metadata), 3))
 
 ```{r download-expression}
 
-#Retrieve GEO count data
+#retrieve GEO count data
 combined_file <- "data/raw/GSE226260/GSE226260_combined.ExprData.updated.csv.gz"
 
+#check if file already exists to avoid repeating calls to GEO
 if (!file.exists(combined_file)) {
   dir.create("data/raw/GSE226260", showWarnings = FALSE, recursive = TRUE)
   download.file(
@@ -131,6 +133,7 @@ if (!file.exists(combined_file)) {
   )
 }
 
+#read in expression data, set rownames and convert to matrix
 expr_data <- read.csv(gzfile(combined_file), check.names = FALSE)
 gene_names <- make.unique(as.character(expr_data[[1]]), sep = "_")
 rownames(expr_data) <- gene_names
@@ -149,10 +152,12 @@ expr_gcids <- sub("_.*$", "", colnames(expr_matrix))
 metadata_gcids <- metadata$`gcid:ch1`
 common_gcids <- intersect(expr_gcids, metadata_gcids)
 
+#align by unique gc ids
 gcid_to_expr_col <- setNames(colnames(expr_matrix), expr_gcids)
 expr_matrix <- expr_matrix[, gcid_to_expr_col[common_gcids]]
 metadata <- metadata[match(common_gcids, metadata_gcids), ]
 
+#set column and row names
 colnames(expr_matrix) <- common_gcids
 rownames(metadata) <- common_gcids
 
@@ -288,7 +293,7 @@ var_explained <- round(100 * pca_result$sdev^2 / sum(pca_result$sdev^2), 1)
 print("Variance explained by first 5 PCs:")
 print(var_explained[1:5])
 
-# Plot PC1 vs PC2
+# plot PC1 vs PC2
 pca_plot <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = severity, shape = severity)) +
   geom_point(size = 3, alpha = 0.7) +
   scale_color_manual(values = c("Convalescent" = "blue", "Long_COVID" = "red")) +
@@ -354,16 +359,19 @@ dds <- DESeq(dds)
 ## 4.2 Extract Results
 
 ```{r extract-de-results}
+#extract results
 res_longcovid_vs_conv <- results(
   dds,
   contrast = c("severity", "Long_COVID", "Convalescent"),
   alpha = 0.05
 )
 
+#convert to dataframe and sort by adjusted p-value
 res_df <- as.data.frame(res_longcovid_vs_conv)
 res_df$gene_id <- rownames(res_df)
 res_df <- res_df[order(res_df$padj), ]
 
+#identify significanct features using thresholds for log2FC and adjusted p-value
 res_df$significant <- res_df$padj < PADJ_THRESHOLD & abs(res_df$log2FoldChange) > LOG2FC_THRESHOLD
 res_df$direction <- ifelse(
   res_df$log2FoldChange > LOG2FC_THRESHOLD & res_df$padj < PADJ_THRESHOLD,
@@ -432,7 +440,7 @@ if (nrow(top_de_genes) > 0) {
 ## 5.1 Volcano Plot
 
 ```{r volcano-plot, fig.width=10, fig.height=8}
-#Generate volcano plot of DE genes
+#generate volcano plot of DE genes from DESeq2
 volcano_data <- res_df[!is.na(res_df$padj), ]
 volcano_data$neg_log10_padj <- -log10(volcano_data$padj)
 volcano_data$color_group <- ifelse(volcano_data$direction == "Up", "Upregulated in Long COVID",
@@ -442,6 +450,7 @@ volcano_data$color_group <- ifelse(volcano_data$direction == "Up", "Upregulated 
                                      "Not Significant")
                                    )
 
+#generate plot
 volcano_plot <- ggplot(volcano_data, aes(x = log2FoldChange, y = neg_log10_padj, color = color_group)) +
   geom_point(alpha = 0.6, size = 1.5) +
   geom_hline(yintercept = -log10(PADJ_THRESHOLD), linetype = "dashed", color = "black") +
@@ -466,20 +475,23 @@ ggsave("results/figures/volcano_plot_longcovid.png", volcano_plot, width = 10, h
 # 7. Machine Learning: Random Forest
 
 ```{r RF-cross-validation-with-feature-selection}
+#set seed for reproducibility 
 set.seed(3)
 #create folds based on class distribution
 folds <- createFolds(coldata$severity, k = N_FOLDS, returnTrain = TRUE)
 
+#initizalize list to hold results from each fold
 cv_predictions <- list()
 feature_importance_list <- list()
 
 #loop for nested cross-validation. DESeq2 will run inside each fold to identifty features
 for(i in seq_along(folds)) {
   
+  # identify training/test samples for this fold
   train_indices <- folds[[i]]
   test_indices <- setdiff(seq_len(ncol(expr_matrix_counts)), train_indices)
   
-  # use training data
+  # extract raw RNA-seq counts and metadata for training samples only
   train_counts <- expr_matrix_counts[, train_indices]
   train_coldata <- coldata[train_indices, , drop = FALSE]
   
@@ -490,40 +502,43 @@ for(i in seq_along(folds)) {
     design = ~ severity
   )
   
-  #run DESeq for training data
+  #run DESeq for training data and extract differential expression results comparing Long_COVID vs Convalescent
   dds_train <- DESeq(dds_train, quiet = TRUE)
   res_train <- results(dds_train, contrast = c("severity", "Long_COVID", "Convalescent"), alpha = 0.05)
   
-  # identify top genes based on the training split only
+  # convert to dataframe and then filter/sort to identify top genes in training split 
   res_train_df <- as.data.frame(res_train)
   res_train_df <- res_train_df[!is.na(res_train_df$padj), ]
   res_train_sorted <- res_train_df[order(res_train_df$padj), ]
   
+  #use top_genes for RF training
   top_genes_fold <- head(rownames(res_train_sorted), N_TOP_GENES)
    
-  # do VST for both train and test together for consistent scaling (but blind)
+  # do VST for both train and test together for consistent scaling (but blind with not labels for LONG-COVID/Convalescent)
   dds_all <- DESeqDataSetFromMatrix(
     countData = expr_matrix_counts[, c(train_indices, test_indices)],
     colData = coldata[c(train_indices, test_indices), ],
     design = ~ severity
   )
   
+  # apply variance stabilizing transformation
   vst_all <- varianceStabilizingTransformation(dds_all, blind = TRUE)
   vst_mat_all <- assay(vst_all)
 
-  # ensure genes exist for top genes in the fold
+  # confirm that all selected genes are present after transformation
   top_genes_fold <- intersect(top_genes_fold, rownames(vst_mat_all))
 
-  # build train/test vst datasets
+  # transpose train/test vst dataframes for RF input
   train_vst <- t(vst_mat_all[top_genes_fold, train_indices])
   test_vst  <- t(vst_mat_all[top_genes_fold, test_indices])
 
+  #a dd disease labels as the outcome variable
   train_data <- data.frame(train_vst, severity = train_coldata$severity)
   test_data  <- data.frame(test_vst, severity = coldata$severity[test_indices])
   
-  #train on the training split
+  # setup grid for RF training
   rf_grid <- data.frame(mtry = round(sqrt(N_TOP_GENES)))
-
+  #train on the training split
   rf_model_fold <- train(
     severity ~ .,
     data = train_data,
@@ -566,10 +581,11 @@ all_predictions <- do.call(rbind, cv_predictions)
 ```{r confusion-matrix, fig.width=8, fig.height=7}
 cm <- confusionMatrix(all_predictions$pred, all_predictions$obs)
 print(cm)
-
+#convert to dataframe
 cm_table <- as.data.frame(cm$table)
 write.csv(cm_table, "results/tables/nested_confusion_matrix.csv", row.names = FALSE)
 
+#generate plot
 cm_plot <- ggplot(cm_table, aes(x = Reference, y = Prediction, fill = Freq)) +
   geom_tile(color = "white") +
   geom_text(aes(label = Freq), size = 5, fontface = "bold") +
@@ -621,6 +637,7 @@ pr_df <- data.frame(
   precision = pr_obj$curve[,2]
 )
 
+#generate plot
 pr_plot <- ggplot(pr_df, aes(x = recall, y = precision)) +
   geom_line(color = "red", size = 1.2) +
   labs(
@@ -676,6 +693,7 @@ importance_df_annotated <- importance_df_annotated[order(-importance_df_annotate
 
 write.csv(importance_df_annotated, "results/tables/nested_feature_importance.csv", row.names = FALSE)
 
+#generate plot
 importance_plot <- ggplot(importance_df, aes(x = reorder(gene, importance), y = importance)) +
   geom_bar(stat = "identity", fill = "blue") +
   coord_flip() +
