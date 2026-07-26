@@ -61,7 +61,7 @@ library(foreach)
 n_cores <- parallel::detectCores() - 1
 n_cores <- max(1, n_cores)
 registerDoParallel(cores = n_cores)
-set.seed(42)
+set.seed(3)
 
 PADJ_THRESHOLD <- 0.05
 LOG2FC_THRESHOLD <- 1.5
@@ -491,7 +491,7 @@ print(vst_matrix[1:3, 1:3])
 
 ---
 
-# 7. Machine Learning: Feature Selection
+# 7. Machine Learning: Random Forest
 
 ```{r feature-selection}
 set.seed(3)

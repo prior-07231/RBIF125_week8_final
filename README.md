@@ -1,7 +1,12 @@
 Overview
 
 
-This repository contains an automated RNA-seq bioinformatics pipeline designed to distinguish Long COVID (PASC) patients from recovered convalescent controls using PBMC gene expression signatures (GEO Accession: GSE226260). The pipeline integrates data retrieval, quality control, differential expression testing (DESeq2), and supervised machine learning (randomForest / caret) to evaluate diagnostic biomarkers.
+This repository contains an RNA-seq bioinformatics pipeline designed 
+to distinguish Long COVID (PASC) patients from recovered convalescent controls 
+using PBMC gene expression signatures (GEO Accession: GSE226260). The pipeline
+integrates data retrieval, quality control, differential expression testing 
+(DESeq2), and supervised machine learning (randomForest / caret) to evaluate 
+diagnostic biomarkers.
 
 
 Setup
@@ -24,6 +29,9 @@ Usage
 
   Rscript -e "rmarkdown::render('RBIF125_Final_Prior.Rmd', output_format = 'html_document')"
 
+Note: an internet connection is required to retrieve data from GEO database.
+Server connection to GEO can sometimes fail; simply attempt to repeat the command
+in case the connection fails.
 
 Output
 
