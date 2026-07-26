@@ -22,6 +22,7 @@ dependencies:
   - r-randomforest
   - r-caret
   - r-proc
+  - r-prroc
   - r-e1071
   - r-doparallel
   - r-foreach
